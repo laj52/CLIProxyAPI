@@ -1,10 +1,31 @@
 package openai
 
 import (
+	"fmt"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	responsesclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 )
+
+// CodexModels returns the native Codex model catalog through the shared model
+// list writer so plugin interceptors observe it like every other model list.
+func (h *OpenAIAPIHandler) CodexModels(c *gin.Context) {
+	body, errMarshal := codexmodels.MarshalCompact(h.codexClientModelsResponse(c.Query("client_version")))
+	if errMarshal != nil {
+		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Failed to encode model list: %v", errMarshal),
+				Type:    "server_error",
+			},
+		})
+		return
+	}
+	h.WriteModelListResponse(c, h.HandlerType(), body)
+}
 
 func (h *OpenAIAPIHandler) codexClientModelsResponse(clientVersion ...string) map[string]any {
 	version := ""
