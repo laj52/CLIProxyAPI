@@ -9,12 +9,106 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
+	const recovered = `{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":12},"secondary_window":null}}`
+	for _, tc := range []struct {
+		name, path, body                 string
+		status                           int
+		concurrentFailure, wantRecovered bool
+	}{
+		{name: "recovered", body: recovered, wantRecovered: true},
+		{name: "still exhausted", body: `{"rate_limit":{"allowed":false,"limit_reached":true}}`},
+		{name: "weekly exhausted", body: `{"rate_limit":{"allowed":true,"limit_reached":false,"secondary_window":{"used_percent":100}}}`},
+		{name: "additional exhausted", body: `{"rate_limit":{"allowed":true,"limit_reached":false},"additional_rate_limits":[{"rate_limit":{"allowed":false,"limit_reached":true}}]}`},
+		{name: "missing limits", body: `{}`},
+		{name: "malformed", body: `{"rate_limit":`},
+		{name: "failed response", body: recovered, status: http.StatusBadGateway},
+		{name: "other endpoint", path: "/backend-api/wham/rate-limit-reset-credits", body: recovered},
+		{name: "newer failure", body: recovered, concurrentFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t)
+			manager := server.handlers.AuthManager
+			manager.SetSelector(&auth.WeightedRoundRobinSelector{})
+			executor := &codexSearchCaptureExecutor{responseBody: io.NopCloser(strings.NewReader(tc.body)), statuses: []int{tc.status}}
+			manager.RegisterExecutor(executor)
+			const model = "usage-recovery-model"
+			for id, weight := range map[string]int{"usage-account-a": 0, "usage-account-b": 1} {
+				_, err := manager.Register(context.Background(), &auth.Auth{ID: id, Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "pooled-token", "weight": weight}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+			}
+			fail := func(id, model string, status int) {
+				retry := 72 * time.Hour
+				manager.MarkResult(context.Background(), auth.Result{AuthID: id, Provider: "codex", Model: model, Error: &auth.Error{HTTPStatus: status, Message: `{"error":{"type":"usage_limit_reached"}}`}, RetryAfter: &retry})
+			}
+			fail("usage-account-a", model, http.StatusTooManyRequests)
+			fail("usage-account-b", model, http.StatusTooManyRequests)
+			fail("usage-account-b", "unrelated-model", http.StatusForbidden)
+			if tc.concurrentFailure {
+				executor.beforeReturn = func() { fail("usage-account-b", model, http.StatusTooManyRequests) }
+			}
+			path := tc.path
+			if path == "" {
+				path = "/backend-api/wham/usage"
+			}
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer test-key")
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			if path != "/backend-api/wham/usage" {
+				b, _ := manager.GetByID("usage-account-b")
+				if !b.ModelStates[model].Quota.Exceeded {
+					t.Fatal("unrelated endpoint cleared quota")
+				}
+				return
+			}
+			wantStatus := tc.status
+			if wantStatus == 0 {
+				wantStatus = http.StatusOK
+			}
+			if rr.Code != wantStatus || rr.Body.String() != tc.body {
+				t.Fatalf("usage response = %d %s", rr.Code, rr.Body.String())
+			}
+			if len(executor.authIDs) != 1 || executor.authIDs[0] != "usage-account-b" {
+				t.Fatalf("selected accounts = %v", executor.authIDs)
+			}
+			b, _ := manager.GetByID("usage-account-b")
+			if got := !b.ModelStates[model].Quota.Exceeded; got != tc.wantRecovered {
+				t.Fatalf("quota recovered = %v, want %v", got, tc.wantRecovered)
+			}
+			if b.ModelStates["unrelated-model"].LastError == nil {
+				t.Fatal("unrelated error cleared")
+			}
+			a, _ := manager.GetByID("usage-account-a")
+			if !a.ModelStates[model].Quota.Exceeded {
+				t.Fatal("other account quota cleared")
+			}
+			if tc.wantRecovered {
+				selected, err := manager.SelectAuth(context.Background(), "codex", model, coreexecutor.Options{})
+				if err != nil || selected.ID != "usage-account-b" {
+					t.Fatalf("generation selection after usage = %v, %v", selected, err)
+				}
+				registry.GetGlobalRegistry().UnregisterClient("usage-account-a")
+				if count := registry.GetGlobalRegistry().GetModelCount(model); count != 1 {
+					t.Fatalf("registry model count = %d, want 1", count)
+				}
+			}
+		})
+	}
+}
 
 func TestCodexBackendPassthroughForwardsUsageWithPooledOAuthCredential(t *testing.T) {
 	server := newTestServer(t)

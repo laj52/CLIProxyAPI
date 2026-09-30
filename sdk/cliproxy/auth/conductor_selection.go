@@ -1960,6 +1960,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	now := time.Now()
+	if eligibility.credentialPolicy == CredentialPolicyCodexUsageV1 && modelKey == "" {
+		for i, candidate := range candidates {
+			candidate = candidate.Clone()
+			clearRecoveredCodexQuota(candidate, now, now)
+			candidates[i] = candidate
+		}
+	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, now, schedulerAcross)
 	if errAvailable != nil {
 		m.mu.RUnlock()

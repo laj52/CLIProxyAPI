@@ -147,6 +147,10 @@ func (s *Server) codexBackendPooledRequest(c *gin.Context, req *http.Request, pa
 	// route it as the Codex default template; local selection keeps the empty
 	// model like the Codex Live handler.
 	selectionModel := ""
+	policy := auth.CredentialPolicyCodexBackendV1
+	if path == "/wham/usage" && c.Request.Method == http.MethodGet && !s.handlers.AuthManager.HomeEnabled() {
+		policy = auth.CredentialPolicyCodexUsageV1
+	}
 	if s.handlers.AuthManager.HomeEnabled() {
 		selectionModel = registry.CodexClientDefaultModel
 		selection, err = s.handlers.AuthManager.SelectHomeAuthWithCredentialPolicy(ctx, "codex", selectionModel, auth.CredentialPolicyCodexBackendV1, selectionOpts)
@@ -154,7 +158,7 @@ func (s *Server) codexBackendPooledRequest(c *gin.Context, req *http.Request, pa
 			selected = selection.CloneAuth()
 		}
 	} else {
-		selected, err = s.handlers.AuthManager.SelectAuthWithCredentialPolicy(ctx, "codex", selectionModel, auth.CredentialPolicyCodexBackendV1, selectionOpts)
+		selected, err = s.handlers.AuthManager.SelectAuthWithCredentialPolicy(ctx, "codex", selectionModel, policy, selectionOpts)
 	}
 	if err != nil {
 		status := clienterror.HTTPStatusFromErrorOr(err, http.StatusServiceUnavailable)

@@ -537,6 +537,10 @@ func dedupeStrings(values []string) []string {
 
 // ResetQuota clears quota/cooldown state for an auth and resumes registry routing.
 func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []string, error) {
+	return m.resetQuota(ctx, authID, time.Time{})
+}
+
+func (m *Manager) resetQuota(ctx context.Context, authID string, recoveredBefore time.Time) (*Auth, []string, error) {
 	if m == nil {
 		return nil, nil, nil
 	}
@@ -566,21 +570,30 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 	}
 
-	for modelKey, state := range auth.ModelStates {
-		if strings.TrimSpace(modelKey) == "" {
-			continue
+	if !recoveredBefore.IsZero() {
+		var changed bool
+		models, changed = clearRecoveredCodexQuota(auth, recoveredBefore, now)
+		if !changed {
+			m.mu.Unlock()
+			return nil, nil, nil
 		}
-		models = append(models, modelKey)
-		if state != nil {
-			resetModelState(state, now)
+	} else {
+		for modelKey, state := range auth.ModelStates {
+			if strings.TrimSpace(modelKey) == "" {
+				continue
+			}
+			models = append(models, modelKey)
+			if state != nil {
+				resetModelState(state, now)
+			}
 		}
-	}
-	if clearCooldownStateForAuth(auth, now) {
-		if len(models) == 0 {
-			models = append(models, registeredModels...)
+		if clearCooldownStateForAuth(auth, now) {
+			if len(models) == 0 {
+				models = append(models, registeredModels...)
+			}
+		} else if len(auth.ModelStates) > 0 {
+			updateAggregatedAvailability(auth, now)
 		}
-	} else if len(auth.ModelStates) > 0 {
-		updateAggregatedAvailability(auth, now)
 	}
 
 	if len(models) == 0 {
