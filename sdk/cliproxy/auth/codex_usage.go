@@ -76,6 +76,7 @@ func clearRecoveredCodexQuota(auth *Auth, before, now time.Time) ([]string, bool
 }
 
 func recoverableCodexQuota(quota QuotaState, lastError *Error, updatedAt, before time.Time) bool {
+	// Auth reloads preserve credential quota locks without preserving LastError.
 	return quota.Exceeded && (quota.Reason == "quota" || quota.Reason == "credential_quota") &&
-		lastError != nil && lastError.HTTPStatus == http.StatusTooManyRequests && !updatedAt.After(before)
+		(lastError == nil || lastError.HTTPStatus == http.StatusTooManyRequests) && !updatedAt.After(before)
 }
