@@ -63,11 +63,19 @@ func clearRecoveredCodexQuota(auth *Auth, before, now time.Time) ([]string, bool
 		changed = true
 	}
 	for model, state := range auth.ModelStates {
-		if state != nil && state.Status != StatusDisabled && recoverableCodexQuota(state.Quota, state.LastError, state.UpdatedAt, before) {
-			resetModelState(state, now)
-			models = append(models, model)
-			changed = true
+		if state == nil || state.Status == StatusDisabled {
+			continue
 		}
+		wrapped := state.credentialQuotaPropagated || state.Quota.Reason == "credential_quota"
+		if wrapped && recoverableCodexQuota(state.Quota, nil, state.UpdatedAt, before) {
+			restoreModelStateAfterCredentialQuota(state, now)
+		} else if recoverableCodexQuota(state.Quota, state.LastError, state.UpdatedAt, before) {
+			resetModelState(state, now)
+		} else {
+			continue
+		}
+		models = append(models, model)
+		changed = true
 	}
 	if changed && len(auth.ModelStates) > 0 {
 		updateAggregatedAvailability(auth, now)

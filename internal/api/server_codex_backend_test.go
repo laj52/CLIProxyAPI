@@ -25,9 +25,11 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 		status                           int
 		concurrentFailure, wantRecovered bool
 		reload                           bool
+		priorFailure                     bool
 	}{
 		{name: "recovered", body: recovered, wantRecovered: true},
 		{name: "recovered after weight reload", body: recovered, reload: true, wantRecovered: true},
+		{name: "recovered with earlier model failure", body: recovered, reload: true, priorFailure: true, wantRecovered: true},
 		{name: "exhausted after weight reload", body: `{"rate_limit":{"allowed":false,"limit_reached":true}}`, reload: true},
 		{name: "newer failure after weight reload", body: recovered, reload: true, concurrentFailure: true},
 		{name: "still exhausted", body: `{"rate_limit":{"allowed":false,"limit_reached":true}}`},
@@ -65,8 +67,13 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 				manager.MarkResult(context.Background(), auth.Result{AuthID: id, Provider: "codex", Model: model, Error: &auth.Error{HTTPStatus: status, Message: `{"error":{"type":"usage_limit_reached"}}`}, RetryAfter: &retry, CredentialScope: tc.reload && status == http.StatusTooManyRequests})
 			}
 			fail("usage-account-a", model, http.StatusTooManyRequests)
+			if tc.priorFailure {
+				fail("usage-account-b", "unrelated-model", http.StatusForbidden)
+			}
 			fail("usage-account-b", model, http.StatusTooManyRequests)
-			fail("usage-account-b", "unrelated-model", http.StatusForbidden)
+			if !tc.priorFailure {
+				fail("usage-account-b", "unrelated-model", http.StatusForbidden)
+			}
 			if tc.reload {
 				reloaded, err := manager.Update(context.Background(), &auth.Auth{ID: "usage-account-b", Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "pooled-token", "weight": 1}})
 				if err != nil {
@@ -112,8 +119,12 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 			if tc.reload && !b.Quota.Exceeded != tc.wantRecovered {
 				t.Fatalf("credential quota recovered = %v, want %v", !b.Quota.Exceeded, tc.wantRecovered)
 			}
-			if b.ModelStates["unrelated-model"].LastError == nil {
+			unrelated := b.ModelStates["unrelated-model"]
+			if unrelated.LastError == nil || unrelated.LastError.HTTPStatus != http.StatusForbidden {
 				t.Fatal("unrelated error cleared")
+			}
+			if tc.wantRecovered && (unrelated.Quota.Exceeded || !unrelated.Unavailable || !unrelated.NextRetryAfter.After(time.Now())) {
+				t.Fatal("quota recovery did not preserve the independent forbidden cooldown")
 			}
 			a, _ := manager.GetByID("usage-account-a")
 			if !a.ModelStates[model].Quota.Exceeded {

@@ -1646,6 +1646,17 @@ func mergeModelState(target, source *ModelState) *ModelState {
 	return target
 }
 
+// restoreModelStateAfterCredentialQuota removes the propagated quota while
+// retaining any independent model cooldown underneath it.
+func restoreModelStateAfterCredentialQuota(state *ModelState, now time.Time) {
+	if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
+		*state = *shadow.cloneShallow()
+		state.UpdatedAt = now
+		return
+	}
+	resetModelState(state, now)
+}
+
 func resetModelState(state *ModelState, now time.Time) {
 	if state == nil {
 		return

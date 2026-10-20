@@ -703,12 +703,7 @@ func applyDevinQuotaRestoration(auth, existing *Auth, now time.Time) bool {
 		// the reporting model ("quota" unwrapped) and pure propagation
 		// targets (no shadow) fully release. Deadline or status heuristics
 		// cannot recover this provenance reliably.
-		if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
-			*state = *shadow.cloneShallow()
-			state.UpdatedAt = now
-			continue
-		}
-		resetModelState(state, now)
+		restoreModelStateAfterCredentialQuota(state, now)
 	}
 	auth.Status = StatusActive
 	auth.StatusMessage = ""
