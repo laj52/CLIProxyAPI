@@ -189,6 +189,8 @@ type Manager struct {
 	authEpochs         map[string]uint64
 	authChangeWatchers map[string]map[chan struct{}]struct{}
 	scheduler          *authScheduler
+	// lastCodexInferenceAuthID is updated by inference results, never usage polls.
+	lastCodexInferenceAuthID string
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths retains legacy session auth lookups for non-execution callers.

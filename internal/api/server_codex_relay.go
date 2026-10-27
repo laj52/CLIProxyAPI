@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
@@ -28,7 +27,6 @@ func (s *Server) relayCodexUpstream(c *gin.Context, ctx context.Context, selecti
 		return
 	}
 	cfg := s.getConfig()
-	requestedAt := time.Now()
 	resp, err := performRequest(selected)
 	if err != nil {
 		if unavailableErr != nil && errors.Is(err, unavailableErr) {
@@ -77,11 +75,6 @@ func (s *Server) relayCodexUpstream(c *gin.Context, ctx context.Context, selecti
 		return
 	}
 	helps.AppendAPIResponseChunk(ctx, cfg, upstreamBody)
-	if selection == nil && c.Request.Method == http.MethodGet && c.Param("segment") == "wham" && c.Param("path") == "/usage" && resp.StatusCode == http.StatusOK {
-		if errReconcile := s.handlers.AuthManager.ReconcileCodexUsage(ctx, selected.ID, upstreamBody, requestedAt); errReconcile != nil {
-			log.WithError(errReconcile).Warn("failed to reconcile Codex usage cooldown")
-		}
-	}
 	if selection != nil && resp.StatusCode == http.StatusUnauthorized {
 		s.handlers.AuthManager.ReportHomeUnauthorized(ctx, selected, "codex", selectionModel, upstreamBody)
 		log.WithField("status", resp.StatusCode).Warnf("%s upstream request failed: %s", label, logging.SafeDiagnosticForLog(string(upstreamBody)))

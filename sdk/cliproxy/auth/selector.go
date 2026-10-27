@@ -1559,6 +1559,7 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 // LookupAffinity observes the current session affinity binding without side effects.
 // It never selects a credential, creates a binding, rebinds, or refreshes TTL.
 // Optional authFilters allow callers (such as Manager) to exclude credentials that do not match the requested provider.
+// An empty model observes all model bindings and succeeds only if they agree on one auth.
 func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID string, authFilters ...func(authID string) bool) (string, string) {
 	if s == nil || s.cache == nil {
 		return "", "unsupported"
@@ -1566,7 +1567,7 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
 	provider = strings.TrimSpace(provider)
 	model = strings.TrimSpace(model)
 	sessionID = strings.TrimSpace(sessionID)
-	if provider == "" || model == "" || sessionID == "" {
+	if provider == "" || sessionID == "" {
 		return "", "unbound"
 	}
 
@@ -1609,8 +1610,14 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
 	for _, candProvider := range providers {
 		for _, cand := range candidates {
 			bounded := cliproxysession.BoundSessionIdentity(cand)
-			key := candProvider + "::" + bounded + "::" + modelKey
-			if authID, ok := s.cache.Get(key); ok && authID != "" {
+			prefix := candProvider + "::" + bounded + "::"
+			var ids []string
+			if modelKey == "" {
+				ids = s.cache.authIDsWithPrefix(prefix)
+			} else if authID, ok := s.cache.Get(prefix + modelKey); ok {
+				ids = []string{authID}
+			}
+			for _, authID := range ids {
 				if authFilter != nil && !authFilter(authID) {
 					continue
 				}

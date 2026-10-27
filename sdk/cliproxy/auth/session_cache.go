@@ -119,6 +119,23 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	return "", false
 }
 
+// authIDsWithPrefix observes live bindings without refreshing or modifying them.
+func (c *SessionCache) authIDsWithPrefix(prefix string) []string {
+	if c == nil || prefix == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	now := time.Now()
+	var ids []string
+	for key, entry := range c.entries {
+		if strings.HasPrefix(key, prefix) && now.Before(entry.expiresAt) {
+			ids = append(ids, entry.authID)
+		}
+	}
+	return ids
+}
+
 // GetAndRefresh retrieves the auth ID bound to a session and refreshes the TTL
 // for every identifier known to represent the same logical session.
 func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {

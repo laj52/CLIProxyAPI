@@ -40,7 +40,11 @@ func TestSessionAffinitySelector_LookupAffinity(t *testing.T) {
 
 		// Perform multiple lookups
 		for i := 0; i < 10; i++ {
-			authID, status := selector.LookupAffinity("anthropic", "claude-3-7-sonnet", "sess-alpha")
+			model := "claude-3-7-sonnet"
+			if i%2 == 0 {
+				model = ""
+			}
+			authID, status := selector.LookupAffinity("anthropic", model, "sess-alpha")
 			if status != "bound" || authID != authA.ID {
 				t.Fatalf("lookup failed: authID=%s status=%s", authID, status)
 			}
@@ -71,6 +75,10 @@ func TestSessionAffinitySelector_LookupAffinity(t *testing.T) {
 		authID, status := selector.LookupAffinity("anthropic", "claude-3-7-sonnet", "sess-alpha")
 		if status != "unbound" || authID != "" {
 			t.Fatalf("expected unbound for expired entry, got status=%s authID=%s", status, authID)
+		}
+		authID, status = selector.LookupAffinity("anthropic", "", "sess-alpha")
+		if status != "unbound" || authID != "" {
+			t.Fatalf("model-less lookup returned expired binding: %s %s", status, authID)
 		}
 	})
 }

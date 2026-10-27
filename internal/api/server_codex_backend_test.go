@@ -18,6 +18,85 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
+type codexUsageCountingSelector struct{ calls int }
+
+func (s *codexUsageCountingSelector) Pick(_ context.Context, _, _ string, _ coreexecutor.Options, candidates []*auth.Auth) (*auth.Auth, error) {
+	s.calls++
+	return candidates[0], nil
+}
+
+func TestCodexResetCreditsOnlyObservesInferenceAccount(t *testing.T) {
+	for _, mode := range []string{"bound", "missing session", "unbound", "ambiguous", "quota exhausted"} {
+		t.Run(mode, func(t *testing.T) {
+			server := newTestServer(t)
+			manager := server.handlers.AuthManager
+			fallback := &codexUsageCountingSelector{}
+			selector := auth.NewSessionAffinitySelector(fallback)
+			t.Cleanup(selector.Stop)
+			manager.SetSelector(selector)
+			executor := &codexSearchCaptureExecutor{}
+			manager.RegisterExecutor(executor)
+			accounts := make([]*auth.Auth, 0, 2)
+			for _, id := range []string{"pro", "lite"} {
+				a, err := manager.Register(context.Background(), &auth.Auth{ID: id, Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "test-token", "weight": 1}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				accounts = append(accounts, a)
+			}
+			if mode != "unbound" {
+				_, err := selector.Pick(context.Background(), "mixed", "gpt-test", coreexecutor.Options{Headers: http.Header{"Session_id": []string{"session-a"}}}, accounts[:1])
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "ambiguous" {
+				_, err := selector.Pick(context.Background(), "mixed", "other-model", coreexecutor.Options{Headers: http.Header{"Session_id": []string{"session-a"}}}, accounts[1:])
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "quota exhausted" {
+				cooldown := time.Hour
+				manager.MarkResult(context.Background(), auth.Result{AuthID: "pro", Provider: "codex", Model: "gpt-test", CredentialScope: true, Error: &auth.Error{HTTPStatus: 429}, RetryAfter: &cooldown})
+				// A quota read must remain possible for an existing binding, even when inference is exhausted.
+				_, err := selector.Pick(context.Background(), "mixed", "gpt-test", coreexecutor.Options{Headers: http.Header{"Session_id": []string{"session-a"}}}, accounts[:1])
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := fallback.calls
+			for i := 0; i < 4; i++ {
+				req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/rate-limit-reset-credits", nil)
+				req.Header.Set("Authorization", "Bearer test-key")
+				if mode != "missing session" {
+					req.Header.Set("Session_id", "session-a")
+				}
+				rr := httptest.NewRecorder()
+				server.engine.ServeHTTP(rr, req)
+				want := http.StatusNoContent
+				if mode == "bound" || mode == "quota exhausted" {
+					want = http.StatusOK
+				}
+				if rr.Code != want {
+					t.Fatalf("status = %d, want %d", rr.Code, want)
+				}
+			}
+			if fallback.calls != before {
+				t.Fatalf("usage selected accounts %d times", fallback.calls-before)
+			}
+			for _, id := range executor.authIDs {
+				if id != "pro" {
+					t.Fatalf("usage read another account: %s", id)
+				}
+			}
+			if mode != "bound" && mode != "quota exhausted" && executor.httpCalls != 0 {
+				t.Fatal("unidentified usage reached upstream")
+			}
+		})
+	}
+}
+
 func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 	const recovered = `{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":12},"secondary_window":null}}`
 	for _, tc := range []struct {
@@ -44,10 +123,9 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			server := newTestServer(t)
 			manager := server.handlers.AuthManager
-			manager.SetSelector(&auth.WeightedRoundRobinSelector{})
-			if tc.reload {
-				manager.SetSelector(auth.NewSessionAffinitySelectorWithConfig(auth.SessionAffinityConfig{Fallback: &auth.WeightedRoundRobinSelector{}}))
-			}
+			selector := auth.NewSessionAffinitySelector(&auth.WeightedRoundRobinSelector{})
+			t.Cleanup(selector.Stop)
+			manager.SetSelector(selector)
 			executor := &codexSearchCaptureExecutor{responseBody: io.NopCloser(strings.NewReader(tc.body)), statuses: []int{tc.status}}
 			manager.RegisterExecutor(executor)
 			const model = "usage-recovery-model"
@@ -61,6 +139,12 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 				}
 				registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: model}})
 				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+			}
+			bound, _ := manager.GetByID("usage-account-b")
+			bound.Metadata["weight"] = 1
+			bound.Attributes = nil
+			if _, err := selector.Pick(context.Background(), "mixed", model, coreexecutor.Options{Headers: http.Header{"Session_id": []string{"usage-recovery-session"}}}, []*auth.Auth{bound}); err != nil {
+				t.Fatal(err)
 			}
 			fail := func(id, model string, status int) {
 				retry := 72 * time.Hour
@@ -106,7 +190,11 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 			if wantStatus == 0 {
 				wantStatus = http.StatusOK
 			}
-			if rr.Code != wantStatus || rr.Body.String() != tc.body {
+			unknown := tc.name == "missing limits" || tc.name == "malformed"
+			if unknown {
+				wantStatus = http.StatusBadGateway
+			}
+			if rr.Code != wantStatus || (!unknown && rr.Body.String() != tc.body) {
 				t.Fatalf("usage response = %d %s", rr.Code, rr.Body.String())
 			}
 			if len(executor.authIDs) != 1 || executor.authIDs[0] != "usage-account-b" {
@@ -146,7 +234,7 @@ func TestCodexUsageRecoversQuotaCooldown(t *testing.T) {
 
 func TestCodexBackendPassthroughForwardsUsageWithPooledOAuthCredential(t *testing.T) {
 	server := newTestServer(t)
-	executor := &codexSearchCaptureExecutor{}
+	executor := &codexSearchCaptureExecutor{responseBody: io.NopCloser(strings.NewReader(usageAvailable))}
 	server.handlers.AuthManager.RegisterExecutor(executor)
 	credential := &auth.Auth{
 		ID:       "codex-oauth",
@@ -160,10 +248,17 @@ func TestCodexBackendPassthroughForwardsUsageWithPooledOAuthCredential(t *testin
 	if _, errRegister := server.handlers.AuthManager.Register(context.Background(), credential); errRegister != nil {
 		t.Fatalf("register Codex OAuth credential: %v", errRegister)
 	}
+	selector := auth.NewSessionAffinitySelector(nil)
+	t.Cleanup(selector.Stop)
+	server.handlers.AuthManager.SetSelector(selector)
+	if _, err := selector.Pick(context.Background(), "mixed", "gpt-test", coreexecutor.Options{Headers: http.Header{"Session_id": []string{"usage-session"}}}, []*auth.Auth{credential}); err != nil {
+		t.Fatal(err)
+	}
 
 	// The proxy key rides in the query here so the test also proves it is stripped
 	// from the pooled upstream URL while functional parameters survive.
 	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage?key=test-key&supports_luna_reserve=true", nil)
+	req.Header.Set("Session_id", "usage-session")
 	req.Header.Set("Chatgpt-Account-Id", "acct-client")
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
@@ -320,7 +415,7 @@ func (d *codexBackendHomeDispatcher) RPopAuthWithPolicy(ctx context.Context, mod
 	return d.codexSearchHomeDispatcher.RPopAuthWithPolicy(ctx, model, sessionID, headers, count, policy)
 }
 
-func TestCodexBackendPassthroughSuppliesModelForHomeDispatch(t *testing.T) {
+func TestCodexBackendUsageDoesNotSelectHomeAccount(t *testing.T) {
 	server := newTestServer(t)
 	dispatcher := &codexBackendHomeDispatcher{codexSearchHomeDispatcher: &codexSearchHomeDispatcher{}}
 	server.handlers.AuthManager.SetConfig(&proxyconfig.Config{Home: proxyconfig.HomeConfig{Enabled: true}})
@@ -333,17 +428,14 @@ func TestCodexBackendPassthroughSuppliesModelForHomeDispatch(t *testing.T) {
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusServiceUnavailable, rr.Body.String())
 	}
-	if got, _ := dispatcher.model.Load().(string); got != registry.CodexClientDefaultModel {
-		t.Fatalf("Home dispatch model = %q, want %q", got, registry.CodexClientDefaultModel)
+	if got := dispatcher.model.Load(); got != nil {
+		t.Fatalf("usage dispatched a Home account with model %v", got)
 	}
-	if executor.request == nil {
-		t.Fatal("Codex executor did not receive a request")
-	}
-	if got := executor.request.Header.Get("Authorization"); got != "Bearer home-search-token" {
-		t.Fatalf("Authorization = %q, want Home credential bearer", got)
+	if executor.httpCalls != 0 {
+		t.Fatal("usage without a binding reached upstream")
 	}
 }
 

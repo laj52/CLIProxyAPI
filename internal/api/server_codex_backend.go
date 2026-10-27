@@ -1,28 +1,28 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
 const codexBackendUpstreamBase = "https://chatgpt.com/backend-api"
 
-// codexBackendPooledPaths lists the chatgpt.com backend paths that describe the
-// credential serving the turns rather than the caller's account: usage windows
-// and usage-limit reset credits. Everything else stays account-scoped.
+// codexBackendPooledPaths lists backend paths handled with pool credentials:
+// pool usage reads and session-bound reset credits. Other paths retain caller identity.
 var codexBackendPooledPaths = []string{"/wham/usage", "/wham/rate-limit-reset-credits"}
 
 func codexBackendUsesPooledCredential(path string) bool {
@@ -35,9 +35,8 @@ func codexBackendUsesPooledCredential(path string) bool {
 }
 
 // codexBackendPassthrough serves chatgpt.com backend endpoints so a Codex client
-// can point chatgpt_base_url at the proxy. Usage reads are answered with a pooled
-// Codex OAuth credential, so the client's usage view reflects the pool serving
-// its turns rather than the signed-in account. Account-scoped endpoints (plugins,
+// can point chatgpt_base_url at the proxy. Usage reads report available pool
+// capacity without changing inference routing. Account-scoped endpoints (plugins,
 // settings, tasks, profile) are forwarded with the caller's own identity, so the
 // client keeps the environment of the account it is signed into.
 func (s *Server) codexBackendPassthrough(c *gin.Context) {
@@ -126,8 +125,8 @@ func (s *Server) codexBackendIdentityProxy() *httputil.ReverseProxy {
 	}
 }
 
-// codexBackendPooledRequest answers a usage endpoint with a pooled Codex OAuth
-// credential selected the same way the alpha-search route selects one.
+// codexBackendPooledRequest probes pool usage or forwards account-bound reset-credit operations.
+// Usage probes never invoke inference selection or change affinity bindings.
 func (s *Server) codexBackendPooledRequest(c *gin.Context, req *http.Request, path string) {
 	if s.handlers == nil || s.handlers.AuthManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Codex auth manager unavailable"})
@@ -140,52 +139,17 @@ func (s *Server) codexBackendPooledRequest(c *gin.Context, req *http.Request, pa
 	}
 
 	ctx := context.WithValue(c.Request.Context(), "gin", c)
-	selectionOpts := coreexecutor.Options{Headers: req.Header.Clone(), OriginalRequest: body}
-	var selection *auth.HomeDispatchSelection
-	var selected *auth.Auth
-	// Home dispatch rejects an empty model and a usage read carries none, so
-	// route it as the Codex default template; local selection keeps the empty
-	// model like the Codex Live handler.
-	selectionModel := ""
-	policy := auth.CredentialPolicyCodexBackendV1
-	if path == "/wham/usage" && c.Request.Method == http.MethodGet && !s.handlers.AuthManager.HomeEnabled() {
-		policy = auth.CredentialPolicyCodexUsageV1
-	}
-	if s.handlers.AuthManager.HomeEnabled() {
-		selectionModel = registry.CodexClientDefaultModel
-		selection, err = s.handlers.AuthManager.SelectHomeAuthWithCredentialPolicy(ctx, "codex", selectionModel, auth.CredentialPolicyCodexBackendV1, selectionOpts)
-		if selection != nil {
-			selected = selection.CloneAuth()
+	sessionID := auth.ExtractSessionID(req.Header, body, nil)
+	selected, binding := s.handlers.AuthManager.LookupSessionAffinity("codex", "", sessionID)
+	poolUsage := req.Method == http.MethodGet && path == "/wham/usage"
+	if !poolUsage && (binding != "bound" || selected == nil || selected.Disabled || selected.Status == auth.StatusDisabled || selected.AuthKind() != auth.AuthKindOAuth) {
+		if req.Method == http.MethodGet || req.Method == http.MethodHead {
+			c.Status(http.StatusNoContent)
+		} else {
+			c.JSON(http.StatusConflict, gin.H{"error": "Codex inference account is not identified"})
 		}
-	} else {
-		selected, err = s.handlers.AuthManager.SelectAuthWithCredentialPolicy(ctx, "codex", selectionModel, policy, selectionOpts)
-	}
-	if err != nil {
-		status := clienterror.HTTPStatusFromErrorOr(err, http.StatusServiceUnavailable)
-		for _, value := range auth.SafeResponseHeaders(err).Values("Retry-After") {
-			c.Writer.Header().Add("Retry-After", value)
-		}
-		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	if selected == nil {
-		if selection != nil {
-			selection.End("missing_auth")
-		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Codex auth unavailable"})
-		return
-	}
-	if selection != nil {
-		attemptCtx, release, errBind := homeSelectionAttemptContext(ctx, selection)
-		if errBind != nil {
-			selection.End("attempt_bind_failed")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errBind.Error()})
-			return
-		}
-		ctx = attemptCtx
-		defer release()
-	}
-	logging.SetGinCPATraceID(c, selected.EnsureIndex())
 
 	upstreamURL := codexBackendUpstreamBase + path
 	if rawQuery := req.URL.RawQuery; rawQuery != "" {
@@ -205,6 +169,7 @@ func (s *Server) codexBackendPooledRequest(c *gin.Context, req *http.Request, pa
 		requestBody = body
 	}
 	performRequest := func(current *auth.Auth) (*http.Response, error) {
+		logging.SetGinCPATraceID(c, current.EnsureIndex())
 		headers := baseHeaders.Clone()
 		if accountID, ok := current.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
 			headers.Set("Chatgpt-Account-Id", accountID)
@@ -227,5 +192,73 @@ func (s *Server) codexBackendPooledRequest(c *gin.Context, req *http.Request, pa
 		})
 		return s.handlers.AuthManager.HttpRequest(ctx, current, req)
 	}
-	s.relayCodexUpstream(c, ctx, selection, selected, selectionModel, "codex backend passthrough", performRequest, nil)
+	if poolUsage {
+		candidates := s.handlers.AuthManager.CodexUsageCandidates()
+		if len(candidates) == 0 {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No enabled Codex OAuth accounts with positive weight"})
+			return
+		}
+		request := performRequest
+		performRequest = func(_ *auth.Auth) (*http.Response, error) {
+			return s.codexBackendPoolUsage(ctx, candidates, request)
+		}
+	}
+	s.relayCodexUpstream(c, ctx, nil, selected, "", "codex backend passthrough", performRequest, nil)
+}
+
+// codexBackendPoolUsage returns one upstream snapshot, never a fabricated combined quota.
+func (s *Server) codexBackendPoolUsage(ctx context.Context, candidates []*auth.Auth, request func(*auth.Auth) (*http.Response, error)) (*http.Response, error) {
+	var exhausted, failed *http.Response
+	var probeErr error
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		requestedAt := time.Now()
+		resp, err := request(candidate)
+		if err != nil {
+			probeErr = err
+			continue
+		}
+		body, errRead := io.ReadAll(io.LimitReader(resp.Body, (32<<20)+1))
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Warn("close Codex usage response")
+		}
+		if errRead != nil {
+			probeErr = errRead
+			continue
+		}
+		if len(body) > 32<<20 {
+			probeErr = errors.New("Codex usage response exceeds size limit")
+			continue
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		if resp.StatusCode != http.StatusOK {
+			if failed == nil {
+				failed = resp
+			}
+			continue
+		}
+		available, known := auth.CodexUsageAvailability(body)
+		if !known {
+			probeErr = errors.New("Codex usage response did not establish available quota")
+			continue
+		}
+		if available {
+			if errReconcile := s.handlers.AuthManager.ReconcileCodexUsage(ctx, candidate.ID, body, requestedAt); errReconcile != nil {
+				log.WithError(errReconcile).Warn("failed to reconcile Codex usage cooldown")
+			}
+			return resp, nil
+		}
+		if exhausted == nil {
+			exhausted = resp
+		}
+	}
+	if probeErr != nil {
+		return nil, probeErr
+	}
+	if failed != nil {
+		return failed, nil
+	}
+	return exhausted, nil
 }

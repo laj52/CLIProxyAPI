@@ -957,6 +957,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
 		auth.recordRecentRequest(now, result.Success)
+		if auth.Provider == "codex" && modelKey != "" && !result.SkipQuotaObservation {
+			m.lastCodexInferenceAuthID = auth.ID
+		}
 		if result.Success {
 			auth.Success++
 		} else {
