@@ -12,9 +12,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// CodexClientDefaultModel is the model used for model-less Home usage requests.
-const CodexClientDefaultModel = "gpt-5.5"
-
 //go:embed models/codex_client_models.json
 var embeddedCodexClientModelsJSON []byte
 

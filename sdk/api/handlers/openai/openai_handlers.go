@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -62,7 +63,18 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
-		h.CodexModels(c)
+		clientVersion := c.Query("client_version")
+		body, errMarshal := codexmodels.MarshalCompact(h.codexClientModelsResponse(clientVersion))
+		if errMarshal != nil {
+			c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: fmt.Sprintf("Failed to encode model list: %v", errMarshal),
+					Type:    "server_error",
+				},
+			})
+			return
+		}
+		h.WriteModelListResponse(c, h.HandlerType(), body)
 		return
 	}
 
